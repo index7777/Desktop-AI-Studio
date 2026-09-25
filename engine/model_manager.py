@@ -10,16 +10,6 @@ def root()->Path:return Path(os.getenv("AI_STUDIO_MODELS",Path.home()/".desktop-
 def model_dir()->Path:return root()/"qwen-image-2.1"
 def marker()->Path:return model_dir()/COMPLETE_MARKER
 def size_bytes(p:Path)->int:return sum(f.stat().st_size for f in p.rglob("*") if f.is_file() and ".cache" not in f.parts) if p.exists() else 0
-def transfer_bytes(p:Path)->int:
- if not p.exists():return 0
- total=0
- for f in p.rglob("*"):
-  if not f.is_file():continue
-  try:
-   # Include Hugging Face local_dir cache/incomplete payloads, but exclude tiny metadata/lock files.
-   if ".cache" not in f.parts or f.name.endswith(".incomplete"):total+=f.stat().st_size
-  except OSError:pass
- return total
 def status():
  p=model_dir()
  return {"id":"qwen-image-2.1","name":"Qwen Image 2.1","modelId":MODEL_ID,"path":str(p),"installed":marker().exists() and (p/"model_index.json").exists(),"sizeBytes":size_bytes(p)}
@@ -32,13 +22,26 @@ def repo_manifest(result:dict):
   emit("manifest",totalBytes=result["total"])
  except Exception as e:
   result["error"]=str(e);emit("metadata-error",message=str(e))
+def _incomplete_candidates(base:Path,name:str):
+ cache=base/".cache"/"huggingface"/"download"/Path(name).parent
+ if not cache.exists():return []
+ target=Path(name).name
+ return [p for p in cache.glob("*") if p.is_file() and p.name.endswith(".incomplete") and (target in p.name or p.parent.name==Path(name).parent.name)]
 def downloaded_bytes(files):
  base=model_dir();total=0
  for name,expected in files:
   p=base/name
-  if p.is_file():
-   try:total+=min(p.stat().st_size,expected)
+  try:
+   if p.is_file():
+    total+=min(p.stat().st_size,expected);continue
+  except OSError:pass
+  # A target can have stale/retried .incomplete blobs. Count only the largest
+  # candidate, never their sum, and cap it at the manifest size.
+  partial=0
+  for candidate in _incomplete_candidates(base,name):
+   try:partial=max(partial,candidate.stat().st_size)
    except OSError:pass
+  total+=min(partial,expected)
  return total
 def install():
  root().mkdir(parents=True,exist_ok=True);marker().unlink(missing_ok=True);disable_progress_bars()
@@ -51,11 +54,12 @@ def install():
   except Exception as e:
    emit("download-error",message=repr(e));download_error.append(e)
  dt=threading.Thread(target=download,daemon=True);dt.start()
- emit("progress",downloadedBytes=transfer_bytes(model_dir()),totalBytes=0,percent=None)
+ # Do not emit a bogus aggregate before the manifest maps cache blobs to files.
+ emit("progress",downloadedBytes=size_bytes(model_dir()),totalBytes=0,percent=None)
  last=(-1,-1)
  while dt.is_alive():
   files=meta.get("files");total=int(meta.get("total",0))
-  downloaded=downloaded_bytes(files) if files else transfer_bytes(model_dir())
+  downloaded=downloaded_bytes(files) if files else size_bytes(model_dir())
   state=(downloaded,total)
   if state!=last:
    pct=round(min(downloaded,total)*100/total,1) if total else None
