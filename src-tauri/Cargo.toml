@@ -5,6 +5,8 @@ description = "Local-first AI image studio"
 authors = ["Desktop AI Studio"]
 edition = "2021"
 
+[package.metadata]
+
 [lib]
 name = "desktop_ai_studio_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
