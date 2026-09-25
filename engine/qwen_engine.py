@@ -3,6 +3,7 @@ import os,secrets,time
 from pathlib import Path
 from typing import Callable
 import torch
+from PIL import Image
 from diffusers import QwenImage21Pipeline
 from protocol import GenerateRequest
 DEFAULT_MODEL="Qwen/Qwen-Image-2.1"
@@ -15,15 +16,18 @@ class QwenEngine:
  def __init__(self)->None:self.pipe:QwenImage21Pipeline|None=None
  def load(self,progress:Callable[[str],None]|None=None)->None:
   if self.pipe is not None:return
-  if not torch.cuda.is_available():raise RuntimeError("Qwen Image 2.1 MVP requires a CUDA-capable NVIDIA GPU.")
+  if not torch.cuda.is_available():raise RuntimeError("Qwen Image 2.1 requires a CUDA-capable NVIDIA GPU.")
   if progress:progress("loading-model")
-  self.pipe=QwenImage21Pipeline.from_pretrained(model_source(),dtype=torch.bfloat16).to("cuda")
+  self.pipe=QwenImage21Pipeline.from_pretrained(model_source(),dtype=torch.bfloat16)
+  self.pipe.enable_model_cpu_offload()
   if progress:progress("model-ready")
  def generate(self,req:GenerateRequest,progress:Callable[[str],None]|None=None)->dict:
   self.load(progress);assert self.pipe is not None
   seed=req.seed if req.seed>=0 else secrets.randbelow(2**31-1);g=torch.Generator("cuda").manual_seed(seed);Path(req.output_path).parent.mkdir(parents=True,exist_ok=True);started=time.perf_counter()
-  kwargs=dict(prompt=req.prompt,width=req.width,height=req.height,num_inference_steps=req.steps,generator=g,true_cfg_scale=req.true_cfg_scale)
+  kwargs=dict(prompt=req.prompt,num_inference_steps=req.steps,generator=g,true_cfg_scale=req.true_cfg_scale)
+  if req.input_path:kwargs["image"]=Image.open(req.input_path).convert("RGB")
+  else:kwargs.update(width=req.width,height=req.height)
   if req.negative_prompt:kwargs["negative_prompt"]=req.negative_prompt
   if progress:progress("generating")
   image=self.pipe(**kwargs).images[0];image.save(req.output_path)
-  return {"path":str(Path(req.output_path).resolve()),"seed":seed,"elapsedSeconds":round(time.perf_counter()-started,3),"width":req.width,"height":req.height}
+  return {"path":str(Path(req.output_path).resolve()),"seed":seed,"elapsedSeconds":round(time.perf_counter()-started,3),"width":image.width,"height":image.height}
