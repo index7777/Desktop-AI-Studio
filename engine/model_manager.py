@@ -22,6 +22,7 @@ def emit_progress(downloaded:int,total:int):
  pct=round(min(downloaded,total)*100/total,1) if total else 0
  print(json.dumps({"event":"progress","downloadedBytes":min(downloaded,total),"totalBytes":total,"percent":pct}),flush=True)
 def repo_manifest():
+ print(json.dumps({"event":"phase","phase":"metadata","message":"正在取得模型資訊…"}),flush=True)
  info=HfApi().model_info(MODEL_ID,files_metadata=True)
  files=[(s.rfilename,int(s.size or 0)) for s in (info.siblings or [])]
  return files,sum(size for _,size in files)
