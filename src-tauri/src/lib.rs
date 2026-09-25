@@ -1,54 +1,9 @@
-use serde::Serialize;
-use std::process::Command;
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HardwareStatus {
-    gpu_name: String,
-    vram_total_mb: Option<u64>,
-    vram_free_mb: Option<u64>,
-    nvidia_available: bool,
-    engine_state: String,
-}
-
-#[tauri::command]
-fn hardware_status() -> HardwareStatus {
-    let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"])
-        .output();
-
-    if let Ok(output) = output {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Some(line) = text.lines().next() {
-                let parts: Vec<_> = line.split(',').map(str::trim).collect();
-                return HardwareStatus {
-                    gpu_name: parts.first().unwrap_or(&"NVIDIA GPU").to_string(),
-                    vram_total_mb: parts.get(1).and_then(|v| v.parse().ok()),
-                    vram_free_mb: parts.get(2).and_then(|v| v.parse().ok()),
-                    nvidia_available: true,
-                    engine_state: "runtime-ready".into(),
-                };
-            }
-        }
-    }
-
-    HardwareStatus {
-        gpu_name: "未偵測到 NVIDIA GPU".into(),
-        vram_total_mb: None,
-        vram_free_mb: None,
-        nvidia_available: false,
-        engine_state: "hardware-unavailable".into(),
-    }
-}
-
-#[tauri::command]
-fn app_version() -> &'static str { env!("CARGO_PKG_VERSION") }
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![hardware_status, app_version])
-        .run(tauri::generate_context!())
-        .expect("error while running AI Studio");
-}
+use base64::{engine::general_purpose::STANDARD, Engine}; use serde::{Deserialize,Serialize}; use serde_json::{json,Value}; use std::{io::Write,process::{Command,Stdio}};
+#[derive(Serialize)] #[serde(rename_all="camelCase")] struct HardwareStatus{gpu_name:String,vram_total_mb:Option<u64>,vram_free_mb:Option<u64>,nvidia_available:bool,engine_state:String}
+#[derive(Deserialize)] #[serde(rename_all="camelCase")] struct GenerateRequest{prompt:String,width:u32,height:u32,steps:u32,seed:i64}
+#[derive(Serialize)] #[serde(rename_all="camelCase")] struct GenerateResult{image_data_url:String,path:String,seed:i64,elapsed_seconds:f64,width:u32,height:u32}
+#[tauri::command] fn hardware_status()->HardwareStatus{let o=Command::new("nvidia-smi").args(["--query-gpu=name,memory.total,memory.free","--format=csv,noheader,nounits"]).output();if let Ok(o)=o{if o.status.success(){let t=String::from_utf8_lossy(&o.stdout);if let Some(l)=t.lines().next(){let p:Vec<_>=l.split(',').map(str::trim).collect();return HardwareStatus{gpu_name:p.first().unwrap_or(&"NVIDIA GPU").to_string(),vram_total_mb:p.get(1).and_then(|v|v.parse().ok()),vram_free_mb:p.get(2).and_then(|v|v.parse().ok()),nvidia_available:true,engine_state:"runtime-ready".into()}}}}HardwareStatus{gpu_name:"未偵測到 NVIDIA GPU".into(),vram_total_mb:None,vram_free_mb:None,nvidia_available:false,engine_state:"hardware-unavailable".into()}}
+fn python()->String{std::env::var("AI_STUDIO_PYTHON").unwrap_or_else(|_|if cfg!(windows){"python".into()}else{"python3".into()})}
+#[tauri::command] fn generate_image(request:GenerateRequest)->Result<GenerateResult,String>{let id="desktop-generate";let path=std::env::temp_dir().join("desktop-ai-studio-generated.png");let msg=json!({"id":id,"command":"generate","payload":{"prompt":request.prompt,"width":request.width,"height":request.height,"steps":request.steps,"seed":request.seed,"output_path":path.to_string_lossy()}});let mut child=Command::new(python()).arg("engine/main.py").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e|format!("無法啟動 AI Engine: {e}"))?;{let stdin=child.stdin.as_mut().ok_or("AI Engine stdin unavailable")?;writeln!(stdin,"{}",msg).map_err(|e|e.to_string())?;writeln!(stdin,"{}",json!({"id":"shutdown","command":"shutdown"})).map_err(|e|e.to_string())?;}let out=child.wait_with_output().map_err(|e|e.to_string())?;if !out.status.success(){return Err(String::from_utf8_lossy(&out.stderr).to_string())}let stdout=String::from_utf8_lossy(&out.stdout);let mut done:Option<Value>=None;let mut err=None;for line in stdout.lines(){if let Ok(v)=serde_json::from_str::<Value>(line){if v["id"]==id&&v["event"]=="completed"{done=Some(v["data"].clone())}else if v["id"]==id&&v["event"]=="error"{err=v["data"]["message"].as_str().map(str::to_owned)}}}if let Some(e)=err{return Err(e)}let d=done.ok_or_else(||format!("AI Engine 未回傳完成事件。\n{stdout}"))?;let bytes=std::fs::read(&path).map_err(|e|format!("讀取生成圖片失敗: {e}"))?;Ok(GenerateResult{image_data_url:format!("data:image/png;base64,{}",STANDARD.encode(bytes)),path:d["path"].as_str().unwrap_or_default().into(),seed:d["seed"].as_i64().unwrap_or(request.seed),elapsed_seconds:d["elapsedSeconds"].as_f64().unwrap_or_default(),width:request.width,height:request.height})}
+#[tauri::command] fn app_version()->&'static str{env!("CARGO_PKG_VERSION")}
+#[cfg_attr(mobile,tauri::mobile_entry_point)] pub fn run(){tauri::Builder::default().invoke_handler(tauri::generate_handler![hardware_status,generate_image,app_version]).run(tauri::generate_context!()).expect("error while running AI Studio");}
