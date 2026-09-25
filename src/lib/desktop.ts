@@ -7,5 +7,7 @@ export const getModelStatus=()=>desktopInvoke<ModelStatus>("model_status");
 export const installModel=()=>desktopInvoke<ModelStatus>("install_model");
 export const removeModel=()=>desktopInvoke<ModelStatus>("remove_model");
 
-export type ModelDownloadProgress={event:"progress";downloadedBytes:number;totalBytes:number;percent:number};
+export type ModelDownloadProgress={active:boolean;phase:string;downloadedBytes:number;totalBytes:number;percent:number|null;message?:string|null};
 export async function onModelDownloadProgress(handler:(progress:ModelDownloadProgress)=>void){if(!("__TAURI_INTERNALS__" in window))return()=>{};const{listen}=await import("@tauri-apps/api/event");return listen<ModelDownloadProgress>("model-download-progress",e=>handler(e.payload))}
+
+export const getModelDownloadStatus=()=>desktopInvoke<ModelDownloadProgress>("model_download_status");
