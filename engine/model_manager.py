@@ -10,6 +10,16 @@ def root()->Path:return Path(os.getenv("AI_STUDIO_MODELS",Path.home()/".desktop-
 def model_dir()->Path:return root()/"qwen-image-2.1"
 def marker()->Path:return model_dir()/COMPLETE_MARKER
 def size_bytes(p:Path)->int:return sum(f.stat().st_size for f in p.rglob("*") if f.is_file() and ".cache" not in f.parts) if p.exists() else 0
+def transfer_bytes(p:Path)->int:
+ if not p.exists():return 0
+ total=0
+ for f in p.rglob("*"):
+  if not f.is_file():continue
+  try:
+   # Include Hugging Face local_dir cache/incomplete payloads, but exclude tiny metadata/lock files.
+   if ".cache" not in f.parts or f.name.endswith(".incomplete"):total+=f.stat().st_size
+  except OSError:pass
+ return total
 def status():
  p=model_dir()
  return {"id":"qwen-image-2.1","name":"Qwen Image 2.1","modelId":MODEL_ID,"path":str(p),"installed":marker().exists() and (p/"model_index.json").exists(),"sizeBytes":size_bytes(p)}
@@ -35,14 +45,17 @@ def install():
  meta={};download_error=[]
  mt=threading.Thread(target=repo_manifest,args=(meta,),daemon=True);mt.start()
  def download():
-  try:snapshot_download(repo_id=MODEL_ID,local_dir=model_dir())
-  except Exception as e:download_error.append(e)
+  try:
+   emit("phase",phase="snapshot-start",message="snapshot_download 已啟動")
+   snapshot_download(repo_id=MODEL_ID,local_dir=model_dir(),max_workers=1,etag_timeout=15)
+  except Exception as e:
+   emit("download-error",message=repr(e));download_error.append(e)
  dt=threading.Thread(target=download,daemon=True);dt.start()
- emit("progress",downloadedBytes=size_bytes(model_dir()),totalBytes=0,percent=None)
+ emit("progress",downloadedBytes=transfer_bytes(model_dir()),totalBytes=0,percent=None)
  last=(-1,-1)
  while dt.is_alive():
   files=meta.get("files");total=int(meta.get("total",0))
-  downloaded=downloaded_bytes(files) if files else size_bytes(model_dir())
+  downloaded=downloaded_bytes(files) if files else transfer_bytes(model_dir())
   state=(downloaded,total)
   if state!=last:
    pct=round(min(downloaded,total)*100/total,1) if total else None
