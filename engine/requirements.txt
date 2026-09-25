@@ -1,0 +1,7 @@
+torch>=2.4.0
+transformers>=5.17
+accelerate
+pillow
+huggingface-hub
+# Qwen Image 2.1 support currently requires current Diffusers.
+git+https://github.com/huggingface/diffusers.git
