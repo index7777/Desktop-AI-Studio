@@ -8,7 +8,16 @@ MODEL_ID="Qwen/Qwen-Image-2.1"
 def root()->Path:return Path(os.getenv("AI_STUDIO_MODELS",Path.home()/".desktop-ai-studio"/"models"))
 def model_dir()->Path:return root()/"qwen-image-2.1"
 def size_bytes(p:Path)->int:return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
-def status():p=model_dir();return {"id":"qwen-image-2.1","name":"Qwen Image 2.1","modelId":MODEL_ID,"path":str(p),"installed":(p/"model_index.json").exists(),"sizeBytes":size_bytes(p)}
+def status():
+ p=model_dir();installed=False
+ if (p/"model_index.json").exists():
+  try:
+   files,total=repo_manifest()
+   complete=total>0 and all((p/name).is_file() and (p/name).stat().st_size==expected for name,expected in files if expected>0)
+   installed=complete
+  except Exception:
+   installed=False
+ return {"id":"qwen-image-2.1","name":"Qwen Image 2.1","modelId":MODEL_ID,"path":str(p),"installed":installed,"sizeBytes":size_bytes(p)}
 def emit_progress(downloaded:int,total:int):
  pct=round(min(downloaded,total)*100/total,1) if total else 0
  print(json.dumps({"event":"progress","downloadedBytes":min(downloaded,total),"totalBytes":total,"percent":pct}),flush=True)
