@@ -38,6 +38,7 @@ def install():
   try:snapshot_download(repo_id=MODEL_ID,local_dir=model_dir())
   except Exception as e:download_error.append(e)
  dt=threading.Thread(target=download,daemon=True);dt.start()
+ emit("progress",downloadedBytes=size_bytes(model_dir()),totalBytes=0,percent=None)
  last=(-1,-1)
  while dt.is_alive():
   files=meta.get("files");total=int(meta.get("total",0))
