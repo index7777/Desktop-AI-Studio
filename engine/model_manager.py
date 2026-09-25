@@ -1,11 +1,14 @@
 from __future__ import annotations
 import argparse, json, os, shutil, threading, time
 from pathlib import Path
+from tqdm.auto import tqdm
 from huggingface_hub import HfApi, snapshot_download
-from huggingface_hub.utils import disable_progress_bars
 
 MODEL_ID="Qwen/Qwen-Image-2.1"
 COMPLETE_MARKER=".ai-studio-complete.json"
+_progress_lock=threading.Lock()
+_progress={"n":0,"total":0,"last_n":-1,"last_total":-1}
+
 def root()->Path:return Path(os.getenv("AI_STUDIO_MODELS",Path.home()/".desktop-ai-studio"/"models"))
 def model_dir()->Path:return root()/"qwen-image-2.1"
 def marker()->Path:return model_dir()/COMPLETE_MARKER
@@ -14,62 +17,68 @@ def status():
  p=model_dir()
  return {"id":"qwen-image-2.1","name":"Qwen Image 2.1","modelId":MODEL_ID,"path":str(p),"installed":marker().exists() and (p/"model_index.json").exists(),"sizeBytes":size_bytes(p)}
 def emit(event:str,**data):print(json.dumps({"event":event,**data},ensure_ascii=False),flush=True)
+def emit_progress(n:int,total:int):
+ pct=round(min(n,total)*100/total,1) if total else None
+ emit("progress",downloadedBytes=n,totalBytes=total,percent=pct)
 def repo_manifest(result:dict):
  try:
   info=HfApi().model_info(MODEL_ID,files_metadata=True)
-  files=[(s.rfilename,int(s.size or 0)) for s in (info.siblings or []) if int(s.size or 0)>0]
-  result["files"]=files;result["total"]=sum(x[1] for x in files)
+  result["total"]=sum(int(s.size or 0) for s in (info.siblings or []))
   emit("manifest",totalBytes=result["total"])
  except Exception as e:
   result["error"]=str(e);emit("metadata-error",message=str(e))
-def _incomplete_candidates(base:Path,name:str):
- cache=base/".cache"/"huggingface"/"download"/Path(name).parent
- if not cache.exists():return []
- target=Path(name).name
- return [p for p in cache.glob("*") if p.is_file() and p.name.endswith(".incomplete") and (target in p.name or p.parent.name==Path(name).parent.name)]
-def downloaded_bytes(files):
- base=model_dir();total=0
- for name,expected in files:
-  p=base/name
-  try:
-   if p.is_file():
-    total+=min(p.stat().st_size,expected);continue
-  except OSError:pass
-  # A target can have stale/retried .incomplete blobs. Count only the largest
-  # candidate, never their sum, and cap it at the manifest size.
-  partial=0
-  for candidate in _incomplete_candidates(base,name):
-   try:partial=max(partial,candidate.stat().st_size)
-   except OSError:pass
-  total+=min(partial,expected)
- return total
+
+class JsonProgress(tqdm):
+ """Bridge Hugging Face's aggregate snapshot tqdm into JSON-lines."""
+ def __init__(self,*args,**kwargs):
+  super().__init__(*args,disable=True,**kwargs)
+  with _progress_lock:
+   # Current huggingface_hub creates aggregate transfer/reconstruction bars
+   # with total=0 and grows total as files are scheduled.
+   if self.total:
+    _progress["total"]=max(_progress["total"],int(self.total))
+ def update(self,n=1):
+  if not n:return
+  with _progress_lock:
+   _progress["n"]+=int(n)
+ def refresh(self,*args,**kwargs):return True
+ def close(self):return None
+ def set_description(self,*args,**kwargs):return None
+ def set_description_str(self,*args,**kwargs):return None
+ def set_postfix_str(self,*args,**kwargs):return None
+ def set_transfer_postfix_str(self,*args,**kwargs):return None
+ def update_transfer(self,n=1):
+  # HF/Xet reports network transfer separately. Reconstruction progress is
+  # the stable denominator-compatible signal used for the model percentage.
+  return None
+
 def install():
- root().mkdir(parents=True,exist_ok=True);marker().unlink(missing_ok=True);disable_progress_bars()
+ root().mkdir(parents=True,exist_ok=True);marker().unlink(missing_ok=True)
  meta={};download_error=[]
+ with _progress_lock:
+  _progress.update(n=0,total=0,last_n=-1,last_total=-1)
  mt=threading.Thread(target=repo_manifest,args=(meta,),daemon=True);mt.start()
  def download():
   try:
    emit("phase",phase="snapshot-start",message="snapshot_download 已啟動")
-   snapshot_download(repo_id=MODEL_ID,local_dir=model_dir(),max_workers=1,etag_timeout=15)
+   snapshot_download(repo_id=MODEL_ID,local_dir=model_dir(),max_workers=1,etag_timeout=15,tqdm_class=JsonProgress)
   except Exception as e:
    emit("download-error",message=repr(e));download_error.append(e)
  dt=threading.Thread(target=download,daemon=True);dt.start()
- # Do not emit a bogus aggregate before the manifest maps cache blobs to files.
- emit("progress",downloadedBytes=size_bytes(model_dir()),totalBytes=0,percent=None)
- last=(-1,-1)
+ last=None
  while dt.is_alive():
-  files=meta.get("files");total=int(meta.get("total",0))
-  downloaded=downloaded_bytes(files) if files else size_bytes(model_dir())
-  state=(downloaded,total)
+  manifest_total=int(meta.get("total",0))
+  with _progress_lock:
+   n=int(_progress["n"]);hf_total=int(_progress["total"])
+  total=manifest_total or hf_total
+  state=(n,total)
   if state!=last:
-   pct=round(min(downloaded,total)*100/total,1) if total else None
-   emit("progress",downloadedBytes=downloaded,totalBytes=total,percent=pct);last=state
-  dt.join(0.5)
+   emit_progress(n,total);last=state
+  dt.join(0.25)
  if download_error:raise download_error[0]
  mt.join(timeout=5)
- total=int(meta.get("total",0));files=meta.get("files")
- downloaded=downloaded_bytes(files) if files else size_bytes(model_dir())
- emit("progress",downloadedBytes=downloaded,totalBytes=total,percent=100.0 if total and downloaded>=total else None)
+ total=int(meta.get("total",0))
+ emit_progress(total,total) if total else emit_progress(size_bytes(model_dir()),0)
  marker().write_text(json.dumps({"modelId":MODEL_ID,"completedAt":time.time(),"sizeBytes":size_bytes(model_dir())}),encoding="utf-8")
  return status()
 def remove():shutil.rmtree(model_dir(),ignore_errors=True);return status()
