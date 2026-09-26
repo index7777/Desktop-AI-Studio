@@ -23,6 +23,18 @@ def main() -> None:
             elif command == "generate":
                 payload = {k: v for k, v in message.get("payload", {}).items() if k in allowed}
                 req = GenerateRequest(**payload)
+                emit(request_id, "progress", {"state": "request-validated", "request": {
+                    "promptType": type(req.prompt).__name__,
+                    "promptLength": len(req.prompt) if isinstance(req.prompt, str) else None,
+                    "negativePromptType": type(req.negative_prompt).__name__ if req.negative_prompt is not None else "NoneType",
+                    "negativePromptLength": len(req.negative_prompt) if isinstance(req.negative_prompt, str) else None,
+                    "inputPath": bool(req.input_path), "width": req.width, "height": req.height,
+                    "steps": req.steps, "trueCfgScale": req.true_cfg_scale,
+                }})
+                if not isinstance(req.prompt, str):
+                    raise TypeError(f"prompt must be str, got {type(req.prompt).__name__}")
+                if req.negative_prompt is not None and not isinstance(req.negative_prompt, str):
+                    raise TypeError(f"negative_prompt must be str or None, got {type(req.negative_prompt).__name__}")
                 result = engine.generate(req, lambda state: emit(request_id, "progress", {"state": state}))
                 emit(request_id, "completed", result)
             elif command == "shutdown":
