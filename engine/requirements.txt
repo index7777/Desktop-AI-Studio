@@ -1,4 +1,5 @@
 torch>=2.4.0
+torchvision
 transformers>=5.17
 accelerate
 pillow
