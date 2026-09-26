@@ -11,3 +11,6 @@ export type ModelDownloadProgress={active:boolean;phase:string;downloadedBytes:n
 export async function onModelDownloadProgress(handler:(progress:ModelDownloadProgress)=>void){if(!("__TAURI_INTERNALS__" in window))return()=>{};const{listen}=await import("@tauri-apps/api/event");return listen<ModelDownloadProgress>("model-download-progress",e=>handler(e.payload))}
 
 export const getModelDownloadStatus=()=>desktopInvoke<ModelDownloadProgress>("model_download_status");
+
+export type EngineProgress={requestId:string;state:string};
+export async function onEngineProgress(handler:(progress:EngineProgress)=>void){if(!("__TAURI_INTERNALS__" in window))return()=>{};const{listen}=await import("@tauri-apps/api/event");return listen<EngineProgress>("engine-progress",e=>handler(e.payload))}
