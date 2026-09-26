@@ -62,6 +62,28 @@ class QwenEngine:
         if progress:
             progress(f"model-ready:{self.profile}")
 
+    def self_test(self, prompt: str = "a simple red apple on a white background", progress: Callable[[str], None] | None = None) -> dict:
+        self.load(progress)
+        assert self.pipe is not None
+        if progress:
+            progress("testing-text-encoder")
+        started = time.perf_counter()
+        prompt_embeds, prompt_embeds_mask, image_pad_mask = self.pipe.encode_prompt(
+            image=None,
+            prompt=prompt,
+            device=torch.device("cuda"),
+            num_images_per_prompt=1,
+        )
+        return {
+            "hardwareProfile": self.profile,
+            "vramGB": round(vram_gb(), 2),
+            "promptType": type(prompt).__name__,
+            "promptEmbedsShape": list(prompt_embeds.shape),
+            "promptMaskShape": list(prompt_embeds_mask.shape),
+            "imagePadMaskShape": list(image_pad_mask.shape) if image_pad_mask is not None else None,
+            "elapsedSeconds": round(time.perf_counter() - started, 3),
+        }
+
     def generate(self, req: GenerateRequest, progress: Callable[[str], None] | None = None) -> dict:
         self.load(progress)
         assert self.pipe is not None
