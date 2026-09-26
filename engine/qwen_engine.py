@@ -70,8 +70,10 @@ class QwenEngine:
         Path(req.output_path).parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
 
+        # Qwen Image 2.1 processor expects batch-shaped text input.
+        prompt = [req.prompt]
         kwargs = dict(
-            prompt=req.prompt,
+            prompt=prompt,
             num_inference_steps=req.steps,
             generator=generator,
             true_cfg_scale=req.true_cfg_scale,
@@ -81,7 +83,7 @@ class QwenEngine:
         else:
             kwargs.update(width=req.width, height=req.height)
         if req.negative_prompt:
-            kwargs["negative_prompt"] = req.negative_prompt
+            kwargs["negative_prompt"] = [req.negative_prompt]
 
         if progress:
             progress("generating")
