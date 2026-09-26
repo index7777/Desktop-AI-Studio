@@ -20,6 +20,9 @@ def main() -> None:
             command = message.get("command")
             if command == "ping":
                 emit(request_id, "pong", {})
+            elif command == "component-self-test":
+                result = engine.component_self_test(lambda state: emit(request_id, "progress", {"state": state}))
+                emit(request_id, "completed", result)
             elif command == "self-test":
                 prompt = message.get("payload", {}).get("prompt", "a simple red apple on a white background")
                 if not isinstance(prompt, str):
