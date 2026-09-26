@@ -26,6 +26,28 @@ def vram_gb() -> float:
         return 0.0
     return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 
+def process_memory_gb() -> float:
+    try:
+        import psutil
+        return psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+def system_memory() -> dict:
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        sm = psutil.swap_memory()
+        return {
+            "processRamGB": round(process_memory_gb(), 2),
+            "systemAvailableGB": round(vm.available / (1024 ** 3), 2),
+            "systemUsedPercent": round(vm.percent, 1),
+            "swapUsedGB": round(sm.used / (1024 ** 3), 2),
+            "swapTotalGB": round(sm.total / (1024 ** 3), 2),
+        }
+    except Exception:
+        return {"processRamGB": round(process_memory_gb(), 2)}
+
 def hardware_profile() -> str:
     requested = os.getenv("AI_STUDIO_HARDWARE_PROFILE", "auto").strip().lower()
     if requested in {"low-vram", "normal"}:
@@ -44,11 +66,15 @@ class QwenEngine:
             raise RuntimeError("Qwen Image 2.1 requires a CUDA-capable NVIDIA GPU.")
         if progress:
             progress(f"loading-model:{self.profile}")
+            progress(f"memory-before-load:{system_memory()}")
 
         self.pipe = QwenImage21Pipeline.from_pretrained(
             model_source(),
             dtype=torch.bfloat16,
         )
+
+        if progress:
+            progress(f"memory-after-load:{system_memory()}")
 
         if self.profile == "low-vram":
             self.pipe.enable_sequential_cpu_offload()
@@ -61,12 +87,14 @@ class QwenEngine:
 
         if progress:
             progress(f"model-ready:{self.profile}")
+            progress(f"memory-after-offload:{system_memory()}")
 
     def self_test(self, prompt: str = "a simple red apple on a white background", progress: Callable[[str], None] | None = None) -> dict:
         self.load(progress)
         assert self.pipe is not None
         if progress:
             progress("testing-text-encoder")
+            progress(f"memory-before-encode:{system_memory()}")
         started = time.perf_counter()
         prompt_embeds, prompt_embeds_mask, image_pad_mask = self.pipe.encode_prompt(
             image=None,
@@ -74,6 +102,8 @@ class QwenEngine:
             device=torch.device("cuda"),
             num_images_per_prompt=1,
         )
+        if progress:
+            progress(f"memory-after-encode:{system_memory()}")
         return {
             "hardwareProfile": self.profile,
             "vramGB": round(vram_gb(), 2),
@@ -82,6 +112,7 @@ class QwenEngine:
             "promptMaskShape": list(prompt_embeds_mask.shape),
             "imagePadMaskShape": list(image_pad_mask.shape) if image_pad_mask is not None else None,
             "elapsedSeconds": round(time.perf_counter() - started, 3),
+            "memory": system_memory(),
         }
 
     def generate(self, req: GenerateRequest, progress: Callable[[str], None] | None = None) -> dict:
