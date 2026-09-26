@@ -176,7 +176,7 @@ class QwenEngine:
             "vramGB": round(vram_gb(), 2),
             "promptType": type(prompt).__name__,
             "promptEmbedsShape": list(prompt_embeds.shape),
-            "promptMaskShape": list(prompt_embeds_mask.shape),
+            "promptMaskShape": list(prompt_embeds_mask.shape) if prompt_embeds_mask is not None else None,
             "imagePadMaskShape": list(image_pad_mask.shape) if image_pad_mask is not None else None,
             "elapsedSeconds": round(time.perf_counter() - started, 3),
             "memory": system_memory(),
