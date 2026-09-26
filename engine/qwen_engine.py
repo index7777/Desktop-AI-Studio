@@ -69,35 +69,49 @@ class QwenEngine:
             progress(f"memory-before-load:{system_memory()}")
 
         source = model_source()
-        load_kwargs = {
-            "dtype": torch.bfloat16,
-            "low_cpu_mem_usage": True,
-        }
         if self.profile == "low-vram":
-            # Avoid the large transient allocation caused by constructing every
-            # component eagerly before Accelerate installs CPU offload hooks.
-            load_kwargs["device_map"] = "balanced"
-            load_kwargs["max_memory"] = {
-                0: f"{max(1, int(vram_gb() - 1))}GB",
-                "cpu": "24GB",
-            }
             if progress:
-                progress(f"loading-strategy:balanced:{load_kwargs['max_memory']}")
+                progress("loading-strategy:staged-components")
+            source_path = Path(source)
+            if not source_path.exists():
+                raise RuntimeError("low-vram staged loading requires the locally installed Qwen model.")
 
-        self.pipe = QwenImage21Pipeline.from_pretrained(source, **load_kwargs)
+            index = json.loads((source_path / "model_index.json").read_text(encoding="utf-8"))
+            components = {}
+            for name in ("processor", "scheduler", "text_encoder", "transformer", "vae"):
+                library, class_name = index[name]
+                if progress:
+                    progress(f"component-start:{name}:{system_memory()}")
+                module = __import__(library, fromlist=[class_name])
+                cls = getattr(module, class_name)
+                kwargs = {}
+                if name in {"text_encoder", "transformer", "vae"}:
+                    kwargs["dtype"] = torch.bfloat16
+                    kwargs["low_cpu_mem_usage"] = True
+                components[name] = cls.from_pretrained(str(source_path), subfolder=name, **kwargs)
+                if progress:
+                    progress(f"component-ready:{name}:{system_memory()}")
 
-        if progress:
-            progress(f"memory-after-load:{system_memory()}")
-
-        if self.profile == "low-vram":
-            # device_map already places modules within the configured RAM/VRAM
-            # budget. Do not stack sequential_cpu_offload on top of it.
+            if progress:
+                progress(f"assembling-pipeline:{system_memory()}")
+            self.pipe = QwenImage21Pipeline(
+                scheduler=components["scheduler"],
+                vae=components["vae"],
+                text_encoder=components["text_encoder"],
+                processor=components["processor"],
+                transformer=components["transformer"],
+            )
+            self.pipe.enable_sequential_cpu_offload()
             if hasattr(self.pipe, "enable_vae_tiling"):
                 self.pipe.enable_vae_tiling()
             if hasattr(self.pipe, "enable_vae_slicing"):
                 self.pipe.enable_vae_slicing()
         else:
+            self.pipe = QwenImage21Pipeline.from_pretrained(source, dtype=torch.bfloat16)
             self.pipe.enable_model_cpu_offload()
+
+        if progress:
+            progress(f"memory-after-load:{system_memory()}")
 
         if progress:
             progress(f"model-ready:{self.profile}")
