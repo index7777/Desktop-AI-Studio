@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, secrets, time
+import json, os, secrets, time
 from pathlib import Path
 from typing import Callable
 import torch
@@ -88,6 +88,27 @@ class QwenEngine:
         if progress:
             progress(f"model-ready:{self.profile}")
             progress(f"memory-after-offload:{system_memory()}")
+
+    def component_self_test(self, progress: Callable[[str], None] | None = None) -> dict:
+        source = Path(model_source())
+        if not source.exists():
+            raise RuntimeError("component-self-test requires the local Qwen model directory.")
+        index = json.loads((source / "model_index.json").read_text(encoding="utf-8"))
+        tested = []
+        for name, spec in index.items():
+            if name.startswith("_") or not isinstance(spec, list) or len(spec) != 2:
+                continue
+            library, class_name = spec
+            if progress:
+                progress(f"component-start:{name}:{library}.{class_name}:{system_memory()}")
+            module = __import__(library, fromlist=[class_name])
+            cls = getattr(module, class_name)
+            component = cls.from_pretrained(str(source), subfolder=name, torch_dtype=torch.bfloat16)
+            tested.append(name)
+            if progress:
+                progress(f"component-ok:{name}:{system_memory()}")
+            del component
+        return {"components": tested, "memory": system_memory()}
 
     def self_test(self, prompt: str = "a simple red apple on a white background", progress: Callable[[str], None] | None = None) -> dict:
         self.load(progress)
