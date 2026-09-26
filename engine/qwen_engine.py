@@ -5,7 +5,12 @@ from typing import Callable
 import torch
 from PIL import Image
 from diffusers import QwenImage21Pipeline
-from protocol import GenerateRequest
+
+try:
+    from .protocol import GenerateRequest
+except ImportError:
+    # Support running engine scripts directly (python engine/main.py).
+    from protocol import GenerateRequest
 
 DEFAULT_MODEL = "Qwen/Qwen-Image-2.1"
 
@@ -46,9 +51,6 @@ class QwenEngine:
         )
 
         if self.profile == "low-vram":
-            # Sequential offload minimizes VRAM by moving submodules between CPU/GPU.
-            # It is intentionally slower than model offload and is the safe default
-            # for GPUs such as the 6 GB RTX 2060.
             self.pipe.enable_sequential_cpu_offload()
             if hasattr(self.pipe, "enable_vae_tiling"):
                 self.pipe.enable_vae_tiling()
