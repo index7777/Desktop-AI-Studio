@@ -13,7 +13,7 @@ fn start_engine()->Result<EngineProcess,String>{
  let py=python();let mut child=Command::new(&py).arg(project_root().join("engine/main.py")).current_dir(project_root()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e|format!("無法啟動 AI Engine ({py}): {e}"))?;
  let stdin=child.stdin.take().ok_or("AI Engine stdin unavailable")?;let stdout=child.stdout.take().ok_or("AI Engine stdout unavailable")?;let stderr=child.stderr.take().ok_or("AI Engine stderr unavailable")?;
  let stderr_log=std::sync::Arc::new(Mutex::new(Vec::<String>::new()));let stderr_copy=stderr_log.clone();
- std::thread::spawn(move||{for line in BufReader::new(stderr).lines(){if let Ok(line)=line{eprintln!("[AI Engine] {line}");if let Ok(mut log)=stderr_copy.lock(){log.push(line);if log.len()>80{log.remove(0);}}}}});
+ std::thread::spawn(move||{let mut reader=BufReader::new(stderr);let mut chunk=Vec::new();loop{chunk.clear();match reader.read_until(b'\r',&mut chunk){Ok(0)=>break,Ok(_)=>{let line=String::from_utf8_lossy(&chunk).trim_matches(['\r','\n']).to_string();if !line.is_empty(){eprintln!("[AI Engine] {line}");if let Ok(mut log)=stderr_copy.lock(){log.push(line);if log.len()>80{log.remove(0);}}}},Err(_)=>break}}});
  let mut process=EngineProcess{child,stdin,stdout:BufReader::new(stdout),stderr_log};let mut line=String::new();process.stdout.read_line(&mut line).map_err(|e|format!("讀取 AI Engine ready 失敗: {e}"))?;let ready:Value=serde_json::from_str(line.trim()).map_err(|e|format!("AI Engine ready 格式錯誤: {e}: {line}"))?;if ready["event"]!="ready"{return Err(format!("AI Engine 未進入 ready 狀態: {line}"))}Ok(process)
 }
 fn generate_image_blocking(app:tauri::AppHandle,request:GenerateRequest)->Result<GenerateResult,String>{
