@@ -244,7 +244,7 @@ class QwenEngine:
             try:
                 if progress:
                     progress(f"tokenizer-clean:{type(tokenizer).__name__}:{type(rendered_prompt).__name__}")
-                token_ids = tokenizer.encode(rendered_prompt, add_special_tokens=False)
+                token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(rendered_prompt))
                 input_ids = torch.tensor([token_ids], dtype=torch.long, device="cuda")
                 attention_mask = torch.ones_like(input_ids)
                 model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
