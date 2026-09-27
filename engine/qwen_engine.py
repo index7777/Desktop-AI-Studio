@@ -198,34 +198,51 @@ class QwenEngine:
         if req.input_path:
             condition_images = [Image.open(req.input_path).convert("RGB")]
 
-        # QwenImage21Pipeline's Qwen3-VL processor path is sensitive to
-        # runtime processor/tokenizer API differences. Normalize the exact text
-        # payload at the tokenizer boundary instead of changing the public
-        # pipeline prompt contract.
-        tokenizer = self.pipe.processor.tokenizer
-        original_tokenizer_call = tokenizer.__class__.__call__
+        # Text-only generation does not need multimodal processor routing.
+        # Tokenize the rendered Qwen template directly to avoid ProcessorMixin
+        # reinterpreting the text payload on this Transformers runtime.
+        if condition_images is None:
+            rendered_prompt = self.pipe.prompt_template_t2i.format(req.prompt or " ")
+            tokenizer = self.pipe.processor.tokenizer
+            original_padding_side = tokenizer.padding_side
+            tokenizer.padding_side = "left"
+            try:
+                model_inputs = tokenizer([rendered_prompt], padding=True, return_tensors="pt").to("cuda")
+            finally:
+                tokenizer.padding_side = original_padding_side
 
-        def tokenizer_call_compat(instance, text=None, *args, **kwargs):
-            if isinstance(text, tuple):
-                text = list(text)
-            if isinstance(text, list):
-                text = [str(item) for item in text]
-            elif text is not None and not isinstance(text, str):
-                text = str(text)
-            return original_tokenizer_call(instance, text=text, *args, **kwargs)
-
-        tokenizer.__class__.__call__ = tokenizer_call_compat
-        try:
+            forward_kwargs = {
+                "input_ids": model_inputs.input_ids,
+                "attention_mask": model_inputs.attention_mask,
+                "output_hidden_states": True,
+            }
+            if hasattr(model_inputs, "mm_token_type_ids"):
+                forward_kwargs["mm_token_type_ids"] = model_inputs.mm_token_type_ids
             if progress:
-                progress(f"encoding-prompt:{type(req.prompt).__name__}:{len(req.prompt)}")
+                progress("encoding-prompt:tokenizer-direct")
+            outputs = self.pipe.text_encoder(**forward_kwargs)
+            hidden_states = outputs.hidden_states[-2]
+            attention_mask = model_inputs.attention_mask.bool()
+            prompt_embeds = hidden_states[:, self.pipe._drop_idx :]
+            prompt_embeds_mask = attention_mask[:, self.pipe._drop_idx :]
+            valid_lengths = prompt_embeds_mask.sum(dim=1)
+            selected = prompt_embeds[prompt_embeds_mask]
+            split = torch.split(selected, valid_lengths.tolist(), dim=0)
+            max_len = max(x.shape[0] for x in split)
+            prompt_embeds = torch.stack([
+                torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0])) for x in split
+            ])
+            prompt_embeds_mask = torch.arange(max_len, device=prompt_embeds.device)[None, :] < valid_lengths[:, None]
+            image_pad_mask = torch.zeros_like(prompt_embeds_mask, dtype=torch.bool)
+        else:
+            if progress:
+                progress("encoding-prompt:multimodal-processor")
             prompt_embeds, prompt_embeds_mask, image_pad_mask = self.pipe.encode_prompt(
                 prompt=req.prompt,
                 image=condition_images,
                 device=torch.device("cuda"),
                 num_images_per_prompt=1,
             )
-        finally:
-            tokenizer.__class__.__call__ = original_tokenizer_call
 
         kwargs = dict(
             prompt=None,
