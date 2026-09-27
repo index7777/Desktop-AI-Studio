@@ -139,6 +139,29 @@ class QwenEngine:
             progress(f"model-ready:{self.profile}")
             progress(f"memory-after-offload:{system_memory()}")
 
+    def tokenizer_self_test(self, text: str = "hello world") -> dict:
+        source = Path(model_source())
+        index = json.loads((source / "model_index.json").read_text(encoding="utf-8"))
+        library, class_name = index["processor"]
+        module = __import__(library, fromlist=[class_name])
+        cls = getattr(module, class_name)
+        processor = cls.from_pretrained(str(source), subfolder="processor")
+        tokenizer = processor.tokenizer
+        import transformers, tokenizers
+        result = {
+            "pythonExecutable": os.sys.executable,
+            "pythonVersion": os.sys.version,
+            "transformersVersion": transformers.__version__,
+            "tokenizersVersion": tokenizers.__version__,
+            "processorClass": type(processor).__name__,
+            "tokenizerClass": type(tokenizer).__name__,
+            "textType": type(text).__name__,
+            "textRepr": repr(text),
+        }
+        encoded = tokenizer(text, add_special_tokens=False)
+        result["inputIdsLength"] = len(encoded["input_ids"])
+        return result
+
     def component_self_test(self, progress: Callable[[str], None] | None = None) -> dict:
         source = Path(model_source())
         if not source.exists():
