@@ -88,7 +88,9 @@ class QwenEngine:
                 if name in {"text_encoder", "transformer", "vae"}:
                     kwargs["dtype"] = torch.bfloat16
                     kwargs["low_cpu_mem_usage"] = True
-                if progress:\n                    progress(f"component-from-pretrained-start:{name}")\n                component = cls.from_pretrained(str(source_path), subfolder=name, **kwargs)
+                if progress:
+                    progress(f"component-from-pretrained-start:{name}")
+                component = cls.from_pretrained(str(source_path), subfolder=name, **kwargs)
                 if progress:
                     progress(f"component-from-pretrained-ready:{name}:{system_memory()}")
 
