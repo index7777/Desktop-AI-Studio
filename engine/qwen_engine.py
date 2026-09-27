@@ -88,22 +88,22 @@ class QwenEngine:
                 if name in {"text_encoder", "transformer", "vae"}:
                     kwargs["dtype"] = torch.bfloat16
                     kwargs["low_cpu_mem_usage"] = True
-                component = cls.from_pretrained(str(source_path), subfolder=name, **kwargs)
+                if progress:\n                    progress(f"component-from-pretrained-start:{name}")\n                component = cls.from_pretrained(str(source_path), subfolder=name, **kwargs)
                 if progress:
-                    progress(f"component-ready:{name}:{system_memory()}")
+                    progress(f"component-from-pretrained-ready:{name}:{system_memory()}")
 
                 if name in {"text_encoder", "transformer", "vae"}:
                     from accelerate import disk_offload
                     offload_dir = source_path / ".runtime-offload" / name
                     offload_dir.mkdir(parents=True, exist_ok=True)
                     if progress:
-                        progress(f"component-offload-start:{name}:{system_memory()}")
+                        progress(f"component-offload-start:{name}:{offload_dir}:{system_memory()}")
                     disk_offload(
                         component,
                         offload_dir=str(offload_dir),
                         execution_device=torch.device("cuda"),
                     )
-                    gc.collect()
+                    if progress:\n                        progress(f"component-offload-hooked:{name}:{system_memory()}")\n                    gc.collect()\n                    if progress:\n                        progress(f"component-gc-ready:{name}:{system_memory()}")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     if progress:
