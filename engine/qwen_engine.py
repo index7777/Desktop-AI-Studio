@@ -221,9 +221,11 @@ class QwenEngine:
         if req.input_path:
             condition_images = [Image.open(req.input_path).convert("RGB")]
 
-        # Text-only generation does not need multimodal processor routing.
-        # Tokenize the rendered Qwen template directly to avoid ProcessorMixin
-        # reinterpreting the text payload on this Transformers runtime.
+        # Keep the official Qwen Image 2.1 prompt template and hidden-state
+        # extraction, but tokenize through the already-loaded processor's
+        # tokenizer for text-only requests. A standalone tokenizer sanity test
+        # in this exact environment passes, so this avoids ProcessorMixin's
+        # text routing while preserving the checkpoint's expected template.
         if condition_images is None:
             rendered_prompt = self.pipe.prompt_template_t2i.format(req.prompt or " ")
             tokenizer = self.pipe.processor.tokenizer
@@ -243,19 +245,26 @@ class QwenEngine:
                 forward_kwargs["mm_token_type_ids"] = model_inputs.mm_token_type_ids
             if progress:
                 progress("encoding-prompt:tokenizer-direct")
-            outputs = self.pipe.text_encoder(**forward_kwargs)
-            hidden_states = outputs.hidden_states[-2]
-            attention_mask = model_inputs.attention_mask.bool()
-            prompt_embeds = hidden_states[:, self.pipe._drop_idx :]
-            prompt_embeds_mask = attention_mask[:, self.pipe._drop_idx :]
-            valid_lengths = prompt_embeds_mask.sum(dim=1)
-            selected = prompt_embeds[prompt_embeds_mask]
-            split = torch.split(selected, valid_lengths.tolist(), dim=0)
-            max_len = max(x.shape[0] for x in split)
+
+            text_model = getattr(self.pipe.text_encoder.model, "language_model", self.pipe.text_encoder.model)
+            handle = text_model.norm.register_forward_hook(lambda module, args, output: args[0])
+            try:
+                outputs = self.pipe.text_encoder(**forward_kwargs)
+            finally:
+                handle.remove()
+
+            hidden_states = outputs.hidden_states[-1]
+            valid_hidden = list(self.pipe._extract_masked_hidden(hidden_states, model_inputs.attention_mask))
+            valid_hidden = [sample[self.pipe._drop_idx :] for sample in valid_hidden]
+            attn_mask_list = [torch.ones(sample.size(0), dtype=torch.long, device=sample.device) for sample in valid_hidden]
+            max_seq_len = max(sample.size(0) for sample in valid_hidden)
             prompt_embeds = torch.stack([
-                torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0])) for x in split
+                torch.cat([sample, sample.new_zeros(max_seq_len - sample.size(0), sample.size(1))])
+                for sample in valid_hidden
             ])
-            prompt_embeds_mask = torch.arange(max_len, device=prompt_embeds.device)[None, :] < valid_lengths[:, None]
+            prompt_embeds_mask = torch.stack([
+                torch.cat([mask, mask.new_zeros(max_seq_len - mask.size(0))]) for mask in attn_mask_list
+            ])
             image_pad_mask = torch.zeros_like(prompt_embeds_mask, dtype=torch.bool)
         else:
             if progress:
