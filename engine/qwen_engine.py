@@ -198,12 +198,33 @@ class QwenEngine:
         if req.input_path:
             condition_images = [Image.open(req.input_path).convert("RGB")]
 
-        prompt_embeds, prompt_embeds_mask, image_pad_mask = self.pipe.encode_prompt(
-            prompt=req.prompt,
-            image=condition_images,
-            device=torch.device("cuda"),
-            num_images_per_prompt=1,
-        )
+        # QwenImage21Pipeline currently forwards padding_side through
+        # Qwen3VLProcessor. On some Transformers 5.17 runtimes that kwarg is
+        # mis-routed into the tokenizer input and raises TextEncodeInput.
+        # Set the tokenizer property directly for this call instead.
+        processor = self.pipe.processor
+        tokenizer = processor.tokenizer
+        original_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        try:
+            original_processor_call = processor.__class__.__call__
+
+            def processor_call_without_padding_side(instance, *args, **kwargs):
+                kwargs.pop("padding_side", None)
+                return original_processor_call(instance, *args, **kwargs)
+
+            processor.__class__.__call__ = processor_call_without_padding_side
+            try:
+                prompt_embeds, prompt_embeds_mask, image_pad_mask = self.pipe.encode_prompt(
+                    prompt=req.prompt,
+                    image=condition_images,
+                    device=torch.device("cuda"),
+                    num_images_per_prompt=1,
+                )
+            finally:
+                processor.__class__.__call__ = original_processor_call
+        finally:
+            tokenizer.padding_side = original_padding_side
 
         kwargs = dict(
             prompt=None,
