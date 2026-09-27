@@ -190,18 +190,44 @@ class QwenEngine:
         Path(req.output_path).parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
 
-        kwargs = dict(
+        # Encode text explicitly before __call__. With component-level disk
+        # offload, Qwen3-VL processor/text-encoder hooks are stable here, while
+        # re-entering encode_prompt from the full pipeline can hand the
+        # processor an invalid nested TextEncodeInput on this runtime stack.
+        condition_images = None
+        if req.input_path:
+            condition_images = [Image.open(req.input_path).convert("RGB")]
+
+        prompt_embeds, prompt_embeds_mask, image_pad_mask = self.pipe.encode_prompt(
             prompt=req.prompt,
+            image=condition_images,
+            device=torch.device("cuda"),
+            num_images_per_prompt=1,
+        )
+
+        kwargs = dict(
+            prompt=None,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            image_pad_mask=image_pad_mask,
             num_inference_steps=req.steps,
             generator=generator,
             true_cfg_scale=req.true_cfg_scale,
         )
         if req.input_path:
-            kwargs["image"] = Image.open(req.input_path).convert("RGB")
+            kwargs["image"] = condition_images
         else:
             kwargs.update(width=req.width, height=req.height)
-        if req.negative_prompt:
-            kwargs["negative_prompt"] = req.negative_prompt
+        if req.negative_prompt and req.true_cfg_scale > 1:
+            neg_embeds, neg_mask, neg_image_pad_mask = self.pipe.encode_prompt(
+                prompt=req.negative_prompt,
+                image=condition_images,
+                device=torch.device("cuda"),
+                num_images_per_prompt=1,
+            )
+            kwargs["negative_prompt_embeds"] = neg_embeds
+            kwargs["negative_prompt_embeds_mask"] = neg_mask
+            kwargs["negative_image_pad_mask"] = neg_image_pad_mask
 
         if progress:
             progress("generating")
