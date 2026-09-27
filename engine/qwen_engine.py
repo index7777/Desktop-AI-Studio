@@ -244,17 +244,18 @@ class QwenEngine:
             try:
                 if progress:
                     progress(f"tokenizer-clean:{type(tokenizer).__name__}:{type(rendered_prompt).__name__}")
-                model_inputs = tokenizer(rendered_prompt, padding=True, return_tensors="pt").to("cuda")
+                token_ids = tokenizer.encode(rendered_prompt, add_special_tokens=False)
+                input_ids = torch.tensor([token_ids], dtype=torch.long, device="cuda")
+                attention_mask = torch.ones_like(input_ids)
+                model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             finally:
                 tokenizer.padding_side = original_padding_side
 
             forward_kwargs = {
-                "input_ids": model_inputs.input_ids,
-                "attention_mask": model_inputs.attention_mask,
+                "input_ids": model_inputs["input_ids"],
+                "attention_mask": model_inputs["attention_mask"],
                 "output_hidden_states": True,
             }
-            if hasattr(model_inputs, "mm_token_type_ids"):
-                forward_kwargs["mm_token_type_ids"] = model_inputs.mm_token_type_ids
             if progress:
                 progress("encoding-prompt:tokenizer-direct")
 
