@@ -228,10 +228,22 @@ class QwenEngine:
         # text routing while preserving the checkpoint's expected template.
         if condition_images is None:
             rendered_prompt = self.pipe.prompt_template_t2i.format(req.prompt or " ")
-            tokenizer = self.pipe.processor.tokenizer
+            # tokenizer_self_test succeeds before pipeline construction. Reload
+            # only the lightweight processor here so prompt tokenization cannot
+            # inherit mutable fast-tokenizer state from pipeline initialization.
+            source_path = Path(model_source())
+            index = json.loads((source_path / "model_index.json").read_text(encoding="utf-8"))
+            processor_library, processor_class = index["processor"]
+            processor_module = __import__(processor_library, fromlist=[processor_class])
+            clean_processor = getattr(processor_module, processor_class).from_pretrained(
+                str(source_path), subfolder="processor"
+            )
+            tokenizer = clean_processor.tokenizer
             original_padding_side = tokenizer.padding_side
             tokenizer.padding_side = "left"
             try:
+                if progress:
+                    progress(f"tokenizer-clean:{type(tokenizer).__name__}:{type(rendered_prompt).__name__}")
                 model_inputs = tokenizer(rendered_prompt, padding=True, return_tensors="pt").to("cuda")
             finally:
                 tokenizer.padding_side = original_padding_side
