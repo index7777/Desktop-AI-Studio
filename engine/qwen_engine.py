@@ -1,5 +1,6 @@
 from __future__ import annotations
-import gc, json, os, secrets, time
+import gc, json, os, re, secrets, time, unicodedata
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 import torch
@@ -55,26 +56,158 @@ def hardware_profile() -> str:
     return "low-vram" if vram_gb() < 12 else "normal"
 
 
-def load_text_tokenizer(source_path: Path):
-    """Force a slow Python tokenizer and reject fast/Rust-backed tokenizers.
+def _bytes_to_unicode() -> dict[int, str]:
+    """GPT-2/Qwen byte-to-unicode table, implemented without tokenizers/Rust."""
+    bs = list(range(ord("!"), ord("~") + 1))
+    bs += list(range(ord("¡"), ord("¬") + 1))
+    bs += list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, map(chr, cs)))
 
-    In this Windows runtime, both the private tokenizer._tokenizer.encode() path
-    and the public fast-tokenizer encode() path can terminate the Python process
-    without a catchable exception. Keep generation away from that boundary.
+
+def _get_pairs(word: tuple[str, ...]) -> set[tuple[str, str]]:
+    if len(word) < 2:
+        return set()
+    return {(word[i], word[i + 1]) for i in range(len(word) - 1)}
+
+
+class PurePythonQwen2Tokenizer:
+    """Minimal Qwen2 byte-level BPE tokenizer implemented in pure Python.
+
+    Transformers 5.x Qwen2Tokenizer is itself backed by the Rust `tokenizers`
+    package. In the affected Windows runtime, constructing/encoding with that
+    backend can terminate Python without a catchable exception. This class only
+    implements the encoding behavior needed by Desktop AI Studio's text prompt
+    path and never imports or calls the Rust tokenizer backend.
     """
-    from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(source_path / "processor"),
-        use_fast=False,
-        trust_remote_code=True,
+    PRETOKENIZE_REGEX = (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
+        r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
     )
 
-    if bool(getattr(tokenizer, "is_fast", False)):
-        raise RuntimeError(
-            f"Expected a slow tokenizer, but got fast tokenizer: {type(tokenizer).__name__}"
-        )
-    return tokenizer
+    def __init__(self, processor_dir: Path) -> None:
+        self.processor_dir = processor_dir
+        self.is_fast = False
+        self.vocab = json.loads((processor_dir / "vocab.json").read_text(encoding="utf-8"))
+        self.byte_encoder = _bytes_to_unicode()
+
+        merges_path = processor_dir / "merges.txt"
+        lines = merges_path.read_text(encoding="utf-8").splitlines()
+        merges: list[tuple[str, str]] = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) == 2:
+                merges.append((parts[0], parts[1]))
+        self.bpe_ranks = {pair: rank for rank, pair in enumerate(merges)}
+
+        self.special_token_ids: dict[str, int] = {}
+        config_path = processor_dir / "tokenizer_config.json"
+        if config_path.exists():
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            for raw_id, entry in (config.get("added_tokens_decoder") or {}).items():
+                if isinstance(entry, dict) and isinstance(entry.get("content"), str):
+                    try:
+                        self.special_token_ids[entry["content"]] = int(raw_id)
+                    except (TypeError, ValueError):
+                        pass
+
+        # Some checkpoints also place special tokens directly in vocab.json.
+        for token in ("<|endoftext|>", "<|im_start|>", "<|im_end|>"):
+            if token in self.vocab:
+                self.special_token_ids.setdefault(token, int(self.vocab[token]))
+
+        special_tokens = sorted(self.special_token_ids, key=len, reverse=True)
+        self.special_pattern = re.compile(
+            "(" + "|".join(re.escape(t) for t in special_tokens) + ")"
+        ) if special_tokens else None
+
+        try:
+            import regex as regex_module
+        except Exception as exc:
+            raise RuntimeError(
+                "Pure Python Qwen tokenizer requires the 'regex' package (normally installed with Transformers)."
+            ) from exc
+        self._regex = regex_module.compile(self.PRETOKENIZE_REGEX)
+
+    @lru_cache(maxsize=65536)
+    def _bpe(self, token: str) -> tuple[str, ...]:
+        word = tuple(token)
+        if len(word) <= 1:
+            return word
+
+        pairs = _get_pairs(word)
+        while pairs:
+            bigram = min(pairs, key=lambda pair: self.bpe_ranks.get(pair, float("inf")))
+            if bigram not in self.bpe_ranks:
+                break
+
+            first, second = bigram
+            new_word: list[str] = []
+            i = 0
+            while i < len(word):
+                try:
+                    j = word.index(first, i)
+                except ValueError:
+                    new_word.extend(word[i:])
+                    break
+                new_word.extend(word[i:j])
+                i = j
+                if i < len(word) - 1 and word[i] == first and word[i + 1] == second:
+                    new_word.append(first + second)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            word = tuple(new_word)
+            if len(word) <= 1:
+                break
+            pairs = _get_pairs(word)
+        return word
+
+    def _encode_ordinary(self, text: str) -> list[int]:
+        text = unicodedata.normalize("NFC", text)
+        ids: list[int] = []
+        for piece in self._regex.findall(text):
+            encoded = "".join(self.byte_encoder[b] for b in piece.encode("utf-8"))
+            for bpe_token in self._bpe(encoded):
+                token_id = self.vocab.get(bpe_token)
+                if token_id is None:
+                    raise RuntimeError(f"Qwen BPE token missing from vocab: {bpe_token!r}")
+                ids.append(int(token_id))
+        return ids
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        # Qwen's image prompt template already includes the required special
+        # tokens, so add_special_tokens is intentionally ignored here.
+        if not text:
+            return []
+        if self.special_pattern is None:
+            return self._encode_ordinary(text)
+
+        ids: list[int] = []
+        for part in self.special_pattern.split(text):
+            if not part:
+                continue
+            special_id = self.special_token_ids.get(part)
+            if special_id is not None:
+                ids.append(special_id)
+            else:
+                ids.extend(self._encode_ordinary(part))
+        return ids
+
+
+def load_text_tokenizer(source_path: Path) -> PurePythonQwen2Tokenizer:
+    return PurePythonQwen2Tokenizer(source_path / "processor")
 
 
 class QwenEngine:
@@ -165,26 +298,23 @@ class QwenEngine:
     def tokenizer_self_test(self, text: str = "hello world") -> dict:
         source = Path(model_source())
         tokenizer = load_text_tokenizer(source)
-        import transformers, tokenizers
+        import transformers
         template = (
             "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
             "texture, quantity, text, spatial relationships of the objects and background:\n"
             "<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
         )
         rendered = template.format(text or " ")
-        tokens = tokenizer.tokenize(rendered)
-        token_ids = tokenizer.convert_tokens_to_ids(tokens)
+        token_ids = tokenizer.encode(rendered, add_special_tokens=False)
         return {
             "pythonExecutable": os.sys.executable,
             "pythonVersion": os.sys.version,
             "transformersVersion": transformers.__version__,
-            "tokenizersVersion": tokenizers.__version__,
             "tokenizerClass": type(tokenizer).__name__,
-            "tokenizerIsFast": bool(getattr(tokenizer, "is_fast", False)),
+            "tokenizerIsFast": False,
             "textType": type(text).__name__,
             "renderedType": type(rendered).__name__,
             "renderedLength": len(rendered),
-            "tokenCount": len(tokens),
             "inputIdsLength": len(token_ids),
         }
 
@@ -252,22 +382,18 @@ class QwenEngine:
             source_path = Path(model_source())
 
             if progress:
-                progress("tokenizer-public-load:start")
+                progress("tokenizer-python-load:start")
             tokenizer = load_text_tokenizer(source_path)
             if progress:
                 progress(
-                    f"tokenizer-clean:{type(tokenizer).__name__}:{type(rendered_prompt).__name__}:"
-                    f"fast={bool(getattr(tokenizer, 'is_fast', False))}"
+                    f"tokenizer-python-load:done:{type(tokenizer).__name__}:"
+                    f"vocab={len(tokenizer.vocab)}:merges={len(tokenizer.bpe_ranks)}"
                 )
-                progress("tokenizer-public-tokenize:start")
+                progress("tokenizer-python-encode:start")
 
-            tokens = tokenizer.tokenize(rendered_prompt)
+            token_ids = tokenizer.encode(rendered_prompt, add_special_tokens=False)
             if progress:
-                progress(f"tokenizer-public-tokenize:done:tokens={len(tokens)}")
-
-            token_ids = tokenizer.convert_tokens_to_ids(tokens)
-            if progress:
-                progress(f"tokenizer-public-ids:done:ids={len(token_ids)}")
+                progress(f"tokenizer-python-encode:done:ids={len(token_ids)}")
 
             if not token_ids:
                 raise RuntimeError("Tokenizer returned zero token IDs.")
