@@ -144,10 +144,15 @@ class QwenEngine:
         index = json.loads((source / "model_index.json").read_text(encoding="utf-8"))
         library, class_name = index["processor"]
         module = __import__(library, fromlist=[class_name])
-        cls = getattr(module, class_name)
-        processor = cls.from_pretrained(str(source), subfolder="processor")
+        processor = getattr(module, class_name).from_pretrained(str(source), subfolder="processor")
         tokenizer = processor.tokenizer
         import transformers, tokenizers
+        template = (
+            "<|im_start|>system\\nDescribe the image by detailing the color, shape, size, "
+            "texture, quantity, text, spatial relationships of the objects and background:\\n"
+            "<|im_end|>\\n<|im_start|>user\\n{}<|im_end|>\\n<|im_start|>assistant\\n"
+        )
+        rendered = template.format(text or " ")
         result = {
             "pythonExecutable": os.sys.executable,
             "pythonVersion": os.sys.version,
@@ -156,10 +161,14 @@ class QwenEngine:
             "processorClass": type(processor).__name__,
             "tokenizerClass": type(tokenizer).__name__,
             "textType": type(text).__name__,
-            "textRepr": repr(text),
+            "renderedType": type(rendered).__name__,
+            "renderedLength": len(rendered),
         }
-        encoded = tokenizer(text, add_special_tokens=False)
-        result["inputIdsLength"] = len(encoded["input_ids"])
+        # Exercise the exact native call used by generation, without loading
+        # the 33 GB pipeline. If the process hard-exits here, the native
+        # tokenizer/runtime boundary is the fault.
+        native = tokenizer._tokenizer.encode(rendered, add_special_tokens=False)
+        result["nativeInputIdsLength"] = len(native.ids)
         return result
 
     def component_self_test(self, progress: Callable[[str], None] | None = None) -> dict:
