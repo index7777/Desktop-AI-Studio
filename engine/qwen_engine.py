@@ -198,33 +198,34 @@ class QwenEngine:
         if req.input_path:
             condition_images = [Image.open(req.input_path).convert("RGB")]
 
-        # QwenImage21Pipeline currently forwards padding_side through
-        # Qwen3VLProcessor. On some Transformers 5.17 runtimes that kwarg is
-        # mis-routed into the tokenizer input and raises TextEncodeInput.
-        # Set the tokenizer property directly for this call instead.
-        processor = self.pipe.processor
-        tokenizer = processor.tokenizer
-        original_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = "left"
+        # QwenImage21Pipeline's Qwen3-VL processor path is sensitive to
+        # runtime processor/tokenizer API differences. Normalize the exact text
+        # payload at the tokenizer boundary instead of changing the public
+        # pipeline prompt contract.
+        tokenizer = self.pipe.processor.tokenizer
+        original_tokenizer_call = tokenizer.__class__.__call__
+
+        def tokenizer_call_compat(instance, text=None, *args, **kwargs):
+            if isinstance(text, tuple):
+                text = list(text)
+            if isinstance(text, list):
+                text = [str(item) for item in text]
+            elif text is not None and not isinstance(text, str):
+                text = str(text)
+            return original_tokenizer_call(instance, text=text, *args, **kwargs)
+
+        tokenizer.__class__.__call__ = tokenizer_call_compat
         try:
-            original_processor_call = processor.__class__.__call__
-
-            def processor_call_without_padding_side(instance, *args, **kwargs):
-                kwargs.pop("padding_side", None)
-                return original_processor_call(instance, *args, **kwargs)
-
-            processor.__class__.__call__ = processor_call_without_padding_side
-            try:
-                prompt_embeds, prompt_embeds_mask, image_pad_mask = self.pipe.encode_prompt(
-                    prompt=req.prompt,
-                    image=condition_images,
-                    device=torch.device("cuda"),
-                    num_images_per_prompt=1,
-                )
-            finally:
-                processor.__class__.__call__ = original_processor_call
+            if progress:
+                progress(f"encoding-prompt:{type(req.prompt).__name__}:{len(req.prompt)}")
+            prompt_embeds, prompt_embeds_mask, image_pad_mask = self.pipe.encode_prompt(
+                prompt=req.prompt,
+                image=condition_images,
+                device=torch.device("cuda"),
+                num_images_per_prompt=1,
+            )
         finally:
-            tokenizer.padding_side = original_padding_side
+            tokenizer.__class__.__call__ = original_tokenizer_call
 
         kwargs = dict(
             prompt=None,
