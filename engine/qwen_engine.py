@@ -105,7 +105,11 @@ class QwenEngine:
                         offload_dir=str(offload_dir),
                         execution_device=torch.device("cuda"),
                     )
-                    if progress:\n                        progress(f"component-offload-hooked:{name}:{system_memory()}")\n                    gc.collect()\n                    if progress:\n                        progress(f"component-gc-ready:{name}:{system_memory()}")
+                    if progress:
+                        progress(f"component-offload-hooked:{name}:{system_memory()}")
+                    gc.collect()
+                    if progress:
+                        progress(f"component-gc-ready:{name}:{system_memory()}")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     if progress:
@@ -132,8 +136,6 @@ class QwenEngine:
 
         if progress:
             progress(f"memory-after-load:{system_memory()}")
-
-        if progress:
             progress(f"model-ready:{self.profile}")
             progress(f"memory-after-offload:{system_memory()}")
 
@@ -192,10 +194,6 @@ class QwenEngine:
         Path(req.output_path).parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
 
-        # Encode text explicitly before __call__. With component-level disk
-        # offload, Qwen3-VL processor/text-encoder hooks are stable here, while
-        # re-entering encode_prompt from the full pipeline can hand the
-        # processor an invalid nested TextEncodeInput on this runtime stack.
         condition_images = None
         if req.input_path:
             condition_images = [Image.open(req.input_path).convert("RGB")]
