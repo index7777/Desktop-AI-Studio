@@ -207,7 +207,7 @@ class QwenEngine:
             original_padding_side = tokenizer.padding_side
             tokenizer.padding_side = "left"
             try:
-                model_inputs = tokenizer([rendered_prompt], padding=True, return_tensors="pt").to("cuda")
+                model_inputs = tokenizer(rendered_prompt, padding=True, return_tensors="pt").to("cuda")
             finally:
                 tokenizer.padding_side = original_padding_side
 
