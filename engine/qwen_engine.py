@@ -56,20 +56,25 @@ def hardware_profile() -> str:
 
 
 def load_text_tokenizer(source_path: Path):
-    """Load the Python Qwen2 tokenizer directly from the local processor files.
+    """Force a slow Python tokenizer and reject fast/Rust-backed tokenizers.
 
-    Do not use processor.tokenizer._tokenizer: that is a private backend boundary
-    and has been observed to terminate the Windows Python process without a
-    catchable Python exception in this runtime.
+    In this Windows runtime, both the private tokenizer._tokenizer.encode() path
+    and the public fast-tokenizer encode() path can terminate the Python process
+    without a catchable exception. Keep generation away from that boundary.
     """
-    try:
-        from transformers import Qwen2Tokenizer
-        return Qwen2Tokenizer.from_pretrained(str(source_path / "processor"))
-    except Exception:
-        # Keep a compatibility fallback for Transformers revisions where the
-        # concrete Qwen2 tokenizer import or constructor changes.
-        from transformers import AutoTokenizer
-        return AutoTokenizer.from_pretrained(str(source_path / "processor"), use_fast=False)
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(source_path / "processor"),
+        use_fast=False,
+        trust_remote_code=True,
+    )
+
+    if bool(getattr(tokenizer, "is_fast", False)):
+        raise RuntimeError(
+            f"Expected a slow tokenizer, but got fast tokenizer: {type(tokenizer).__name__}"
+        )
+    return tokenizer
 
 
 class QwenEngine:
@@ -162,12 +167,14 @@ class QwenEngine:
         tokenizer = load_text_tokenizer(source)
         import transformers, tokenizers
         template = (
-            "<|im_start|>system\\nDescribe the image by detailing the color, shape, size, "
-            "texture, quantity, text, spatial relationships of the objects and background:\\n"
-            "<|im_end|>\\n<|im_start|>user\\n{}<|im_end|>\\n<|im_start|>assistant\\n"
+            "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
+            "texture, quantity, text, spatial relationships of the objects and background:\n"
+            "<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
         )
         rendered = template.format(text or " ")
-        result = {
+        tokens = tokenizer.tokenize(rendered)
+        token_ids = tokenizer.convert_tokens_to_ids(tokens)
+        return {
             "pythonExecutable": os.sys.executable,
             "pythonVersion": os.sys.version,
             "transformersVersion": transformers.__version__,
@@ -177,10 +184,9 @@ class QwenEngine:
             "textType": type(text).__name__,
             "renderedType": type(rendered).__name__,
             "renderedLength": len(rendered),
+            "tokenCount": len(tokens),
+            "inputIdsLength": len(token_ids),
         }
-        token_ids = tokenizer.encode(rendered, add_special_tokens=False)
-        result["inputIdsLength"] = len(token_ids)
-        return result
 
     def component_self_test(self, progress: Callable[[str], None] | None = None) -> dict:
         source = Path(model_source())
@@ -241,14 +247,10 @@ class QwenEngine:
         if req.input_path:
             condition_images = [Image.open(req.input_path).convert("RGB")]
 
-        # Text-only generation uses a deliberately conservative tokenizer path.
-        # The previous implementation called tokenizer._tokenizer.encode(), a
-        # private native backend API that could hard-exit the Windows process.
-        # Keep the existing hidden-state extraction for now, but obtain token
-        # IDs through the public Python tokenizer API.
         if condition_images is None:
             rendered_prompt = self.pipe.prompt_template_t2i.format(req.prompt or " ")
             source_path = Path(model_source())
+
             if progress:
                 progress("tokenizer-public-load:start")
             tokenizer = load_text_tokenizer(source_path)
@@ -257,10 +259,18 @@ class QwenEngine:
                     f"tokenizer-clean:{type(tokenizer).__name__}:{type(rendered_prompt).__name__}:"
                     f"fast={bool(getattr(tokenizer, 'is_fast', False))}"
                 )
-                progress("tokenizer-public-encode:start")
-            token_ids = tokenizer.encode(rendered_prompt, add_special_tokens=False)
+                progress("tokenizer-public-tokenize:start")
+
+            tokens = tokenizer.tokenize(rendered_prompt)
             if progress:
-                progress(f"tokenizer-public-encode:done:tokens={len(token_ids)}")
+                progress(f"tokenizer-public-tokenize:done:tokens={len(tokens)}")
+
+            token_ids = tokenizer.convert_tokens_to_ids(tokens)
+            if progress:
+                progress(f"tokenizer-public-ids:done:ids={len(token_ids)}")
+
+            if not token_ids:
+                raise RuntimeError("Tokenizer returned zero token IDs.")
 
             input_ids = torch.tensor([token_ids], dtype=torch.long)
             attention_mask = torch.ones_like(input_ids)
@@ -271,7 +281,7 @@ class QwenEngine:
             attention_mask = attention_mask.to("cuda")
             model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             if progress:
-                progress("tokenizer-tensor-cuda:ready")
+                progress(f"tokenizer-tensor-cuda:ready:shape={tuple(input_ids.shape)}")
 
             forward_kwargs = {
                 "input_ids": model_inputs["input_ids"],
@@ -291,6 +301,9 @@ class QwenEngine:
                 progress("encoding-prompt:text-encoder:done")
 
             hidden_states = outputs.hidden_states[-1]
+            if progress:
+                progress(f"encoding-prompt:hidden-states:shape={tuple(hidden_states.shape)}")
+
             valid_hidden = list(self.pipe._extract_masked_hidden(hidden_states, model_inputs["attention_mask"]))
             valid_hidden = [sample[self.pipe._drop_idx :] for sample in valid_hidden]
             attn_mask_list = [torch.ones(sample.size(0), dtype=torch.long, device=sample.device) for sample in valid_hidden]
