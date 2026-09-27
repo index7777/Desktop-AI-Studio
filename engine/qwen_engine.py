@@ -54,6 +54,24 @@ def hardware_profile() -> str:
         return requested
     return "low-vram" if vram_gb() < 12 else "normal"
 
+
+def load_text_tokenizer(source_path: Path):
+    """Load the Python Qwen2 tokenizer directly from the local processor files.
+
+    Do not use processor.tokenizer._tokenizer: that is a private backend boundary
+    and has been observed to terminate the Windows Python process without a
+    catchable Python exception in this runtime.
+    """
+    try:
+        from transformers import Qwen2Tokenizer
+        return Qwen2Tokenizer.from_pretrained(str(source_path / "processor"))
+    except Exception:
+        # Keep a compatibility fallback for Transformers revisions where the
+        # concrete Qwen2 tokenizer import or constructor changes.
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained(str(source_path / "processor"), use_fast=False)
+
+
 class QwenEngine:
     def __init__(self) -> None:
         self.pipe: QwenImage21Pipeline | None = None
@@ -141,11 +159,7 @@ class QwenEngine:
 
     def tokenizer_self_test(self, text: str = "hello world") -> dict:
         source = Path(model_source())
-        index = json.loads((source / "model_index.json").read_text(encoding="utf-8"))
-        library, class_name = index["processor"]
-        module = __import__(library, fromlist=[class_name])
-        processor = getattr(module, class_name).from_pretrained(str(source), subfolder="processor")
-        tokenizer = processor.tokenizer
+        tokenizer = load_text_tokenizer(source)
         import transformers, tokenizers
         template = (
             "<|im_start|>system\\nDescribe the image by detailing the color, shape, size, "
@@ -158,17 +172,14 @@ class QwenEngine:
             "pythonVersion": os.sys.version,
             "transformersVersion": transformers.__version__,
             "tokenizersVersion": tokenizers.__version__,
-            "processorClass": type(processor).__name__,
             "tokenizerClass": type(tokenizer).__name__,
+            "tokenizerIsFast": bool(getattr(tokenizer, "is_fast", False)),
             "textType": type(text).__name__,
             "renderedType": type(rendered).__name__,
             "renderedLength": len(rendered),
         }
-        # Exercise the exact native call used by generation, without loading
-        # the 33 GB pipeline. If the process hard-exits here, the native
-        # tokenizer/runtime boundary is the fault.
-        native = tokenizer._tokenizer.encode(rendered, add_special_tokens=False)
-        result["nativeInputIdsLength"] = len(native.ids)
+        token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+        result["inputIdsLength"] = len(token_ids)
         return result
 
     def component_self_test(self, progress: Callable[[str], None] | None = None) -> dict:
@@ -230,35 +241,37 @@ class QwenEngine:
         if req.input_path:
             condition_images = [Image.open(req.input_path).convert("RGB")]
 
-        # Keep the official Qwen Image 2.1 prompt template and hidden-state
-        # extraction, but tokenize through the already-loaded processor's
-        # tokenizer for text-only requests. A standalone tokenizer sanity test
-        # in this exact environment passes, so this avoids ProcessorMixin's
-        # text routing while preserving the checkpoint's expected template.
+        # Text-only generation uses a deliberately conservative tokenizer path.
+        # The previous implementation called tokenizer._tokenizer.encode(), a
+        # private native backend API that could hard-exit the Windows process.
+        # Keep the existing hidden-state extraction for now, but obtain token
+        # IDs through the public Python tokenizer API.
         if condition_images is None:
             rendered_prompt = self.pipe.prompt_template_t2i.format(req.prompt or " ")
-            # tokenizer_self_test succeeds before pipeline construction. Reload
-            # only the lightweight processor here so prompt tokenization cannot
-            # inherit mutable fast-tokenizer state from pipeline initialization.
             source_path = Path(model_source())
-            index = json.loads((source_path / "model_index.json").read_text(encoding="utf-8"))
-            processor_library, processor_class = index["processor"]
-            processor_module = __import__(processor_library, fromlist=[processor_class])
-            clean_processor = getattr(processor_module, processor_class).from_pretrained(
-                str(source_path), subfolder="processor"
-            )
-            tokenizer = clean_processor.tokenizer
-            original_padding_side = tokenizer.padding_side
-            tokenizer.padding_side = "left"
-            try:
-                if progress:
-                    progress(f"tokenizer-clean:{type(tokenizer).__name__}:{type(rendered_prompt).__name__}")
-                token_ids = tokenizer._tokenizer.encode(rendered_prompt, add_special_tokens=False).ids
-                input_ids = torch.tensor([token_ids], dtype=torch.long, device="cuda")
-                attention_mask = torch.ones_like(input_ids)
-                model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
-            finally:
-                tokenizer.padding_side = original_padding_side
+            if progress:
+                progress("tokenizer-public-load:start")
+            tokenizer = load_text_tokenizer(source_path)
+            if progress:
+                progress(
+                    f"tokenizer-clean:{type(tokenizer).__name__}:{type(rendered_prompt).__name__}:"
+                    f"fast={bool(getattr(tokenizer, 'is_fast', False))}"
+                )
+                progress("tokenizer-public-encode:start")
+            token_ids = tokenizer.encode(rendered_prompt, add_special_tokens=False)
+            if progress:
+                progress(f"tokenizer-public-encode:done:tokens={len(token_ids)}")
+
+            input_ids = torch.tensor([token_ids], dtype=torch.long)
+            attention_mask = torch.ones_like(input_ids)
+            if progress:
+                progress(f"tokenizer-tensor-cpu:ready:shape={tuple(input_ids.shape)}")
+
+            input_ids = input_ids.to("cuda")
+            attention_mask = attention_mask.to("cuda")
+            model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+            if progress:
+                progress("tokenizer-tensor-cuda:ready")
 
             forward_kwargs = {
                 "input_ids": model_inputs["input_ids"],
@@ -266,7 +279,7 @@ class QwenEngine:
                 "output_hidden_states": True,
             }
             if progress:
-                progress("encoding-prompt:tokenizer-direct")
+                progress("encoding-prompt:text-encoder:start")
 
             text_model = getattr(self.pipe.text_encoder.model, "language_model", self.pipe.text_encoder.model)
             handle = text_model.norm.register_forward_hook(lambda module, args, output: args[0])
@@ -274,9 +287,11 @@ class QwenEngine:
                 outputs = self.pipe.text_encoder(**forward_kwargs)
             finally:
                 handle.remove()
+            if progress:
+                progress("encoding-prompt:text-encoder:done")
 
             hidden_states = outputs.hidden_states[-1]
-            valid_hidden = list(self.pipe._extract_masked_hidden(hidden_states, model_inputs.attention_mask))
+            valid_hidden = list(self.pipe._extract_masked_hidden(hidden_states, model_inputs["attention_mask"]))
             valid_hidden = [sample[self.pipe._drop_idx :] for sample in valid_hidden]
             attn_mask_list = [torch.ones(sample.size(0), dtype=torch.long, device=sample.device) for sample in valid_hidden]
             max_seq_len = max(sample.size(0) for sample in valid_hidden)
@@ -288,6 +303,8 @@ class QwenEngine:
                 torch.cat([mask, mask.new_zeros(max_seq_len - mask.size(0))]) for mask in attn_mask_list
             ])
             image_pad_mask = torch.zeros_like(prompt_embeds_mask, dtype=torch.bool)
+            if progress:
+                progress(f"encoding-prompt:embeds-ready:shape={tuple(prompt_embeds.shape)}")
         else:
             if progress:
                 progress("encoding-prompt:multimodal-processor")
