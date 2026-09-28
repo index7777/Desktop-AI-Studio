@@ -3,7 +3,9 @@ import json, sys, traceback, uuid
 from dataclasses import fields
 from protocol import EngineResponse, GenerateRequest
 from qwen_engine import QwenEngine
+from tokenizer_patch import apply_tokenizer_patch
 
+apply_tokenizer_patch()
 engine = QwenEngine()
 allowed = {f.name for f in fields(GenerateRequest)}
 
